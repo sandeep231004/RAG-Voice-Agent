@@ -1,0 +1,48 @@
+# Core Deep Learning & Audio Libraries
+torch
+torchaudio
+
+# Transformers and Embeddings
+transformers
+sentence-transformers
+ctransformers; sys_platform != 'darwin' or platform_machine != 'arm64'
+
+# Whisper ASR (faster version)
+faster-whisper
+
+# LangChain for pipeline orchestration
+langchain
+langchain-community
+
+# Vector Database
+qdrant-client
+
+# Text-to-Speech (Coqui)
+#TTS @ git+https://github.com/coqui-ai/TTS.git
+
+# Audio Input/Output
+sounddevice
+soundfile
+pyaudio
+
+# Utilities
+numpy
+tqdm
+
+# Optional: for unstructured file loading (HTML, PDF, etc.)
+unstructured
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
