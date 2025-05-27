@@ -224,44 +224,108 @@ class TaskHandler:
         response = self.llm_handler.generate_response(system_prompt, prompt)
 
         return response
-
-
     def _handle_task_request(self, query):
         """
         Handles a task or action request by using the LLM to select and execute the appropriate tool.
         This method relies on the LLM's ability to reason about tool usage.
         """
-        logger.info(f"Handling task request: {query}") 
+        logger.info(f"Handling task request: {query}")
         
-        system_prompt = f"""You are {self.agent_name}, a helpful AI assistant. The user has requested a task.
-    Your job is to determine which tools to use to complete this task.
+        # Direct handling for time queries without using LLM
+        if any(phrase in query.lower() for phrase in ["what time", "current time", "time in", "what's the time"]):
+            location = None
+            query_lower = query.lower()
+            if "in " in query_lower:
+                location = query_lower.split("in ")[-1].strip().strip('?').strip('.')
+                if location:
+                    logger.info(f"Detected time query for location: {location}")
+                    tool = self.tools["web_search"]
+                    result = tool.run(f"current exact time in {location}")
+                    self.state.record_tool_use("web_search")
+                    return self._format_time_response(result, location)
+          # First check for direct mappings to improve reliability
+        direct_mappings = {
+            'news': ('web_search', 'latest news'),
+            'weather': ('web_search', 'current weather'),
+            'stock': ('web_search', 'stock market'),
+            'sports': ('web_search', 'latest sports'),
+            'ai': ('web_search', 'latest artificial intelligence news'),
+            'tech': ('web_search', 'latest technology news')
+        }
+
+        # Check if query matches any direct mappings
+        query_lower = query.lower()
+        for key, (tool, base_query) in direct_mappings.items():
+            if key in query_lower:
+                logger.info(f"Using direct mapping for {key}")
+                return self._execute_tool(tool, base_query)
+
+        system_prompt = f"""You are {self.agent_name}, a helpful AI assistant. Analyze the user's request and respond with a valid JSON object ONLY.
 
     Available tools:
     {self._get_tools_description()}
 
-    Return a JSON object with "tool" (the name of the tool to use) and "parameters" (what to pass to the tool).
-    For 'web_search', the 'parameters' should be a string representing the search query.
-    For 'search_documents', the 'parameters' should be a string representing the document search query.
-    Example for web_search: {{"tool": "web_search", "parameters": "current weather in london"}}
-    Example for search_documents: {{"tool": "search_documents", "parameters": "information about quantum computing"}}""" # Defines system prompt for LLM to select tools.
+    RESPONSE REQUIREMENTS:
+    1. Your response MUST be a JSON object with exactly two fields: "tool" and "parameters"
+    2. The "tool" field must be one of: "web_search" or "search_documents"
+    3. The "parameters" field must be a string (the search query)
+
+    TOOL SELECTION RULES:
+    - Use "web_search" for:
+      * Current events and news
+      * Real-time information
+      * Latest updates
+      * Weather information
+      * Time queries
+      * Stock prices
+      * Sports scores
+    
+    - Use "search_documents" for:
+      * Historical information
+      * Conceptual knowledge
+      * Documentation
+      * Stored information
+      * Past events
+
+    EXAMPLE RESPONSES:
+    {{"tool": "web_search", "parameters": "latest artificial intelligence news and developments"}}
+    {{"tool": "search_documents", "parameters": "history of quantum computing"}}
+    {{"tool": "web_search", "parameters": "current stock market updates"}}"""# Defines system prompt for LLM to select tools.
 
         prompt = f"""User request: "{query}"
 
     Determine which tool to use and the parameters for it."""
 
         tool_selection = self.llm_handler.generate_response(system_prompt, prompt)
-        
         try:
-            # Try to extract JSON from the response (handles markdown code block format and direct JSON).
-            json_match = re.search(r'```json\n(.*?)\n```', tool_selection, re.DOTALL) # Tries to find JSON in a markdown code block.
-            if json_match: 
-                json_str = json_match.group(1) # Extracts the JSON string from the match.
-            else: # If not found.
-                json_str = re.search(r'\{.*\}', tool_selection, re.DOTALL).group(0) # Tries to find direct JSON object.
+            # First try to parse the entire response as JSON
+            try:
+                tool_data = json.loads(tool_selection)
+            except json.JSONDecodeError:
+                # Try to extract JSON from code block
+                json_match = re.search(r'```(?:json)?\s*\n?(.*?)\n?```', tool_selection, re.DOTALL)
+                if json_match:
+                    json_str = json_match.group(1)
+                else:
+                    # Try to find JSON object in the text
+                    json_str = re.search(r'\{[^{}]*\}', tool_selection, re.DOTALL)
+                    if json_str:
+                        json_str = json_str.group(0)
+                    else:
+                        raise ValueError("No JSON found in response")
+                
+                # Clean up the string and parse JSON
+                json_str = json_str.strip()
+                tool_data = json.loads(json_str)
             
-            tool_data = json.loads(json_str) # Parses the JSON string into a Python dictionary.
             tool_name = tool_data.get("tool", "")
-            parameters = tool_data.get("parameters", {})
+            parameters = tool_data.get("parameters", "")
+            
+            # For time-related queries, ensure we're using web search
+            if any(word in query.lower() for word in ["time", "current time", "what time"]):
+                tool_name = "web_search"
+                if isinstance(parameters, str):
+                    parameters = f"current time in {parameters}" if "time" not in parameters.lower() else parameters
             
             logger.info(f"LLM selected tool: {tool_name} with parameters: {parameters}")
         except (json.JSONDecodeError, AttributeError) as e:
@@ -288,12 +352,17 @@ class TaskHandler:
                 result = f"I encountered an error when trying to use the '{tool_name}' tool: {str(e)}"
         else:
             available_tools = ", ".join(self.tools.keys())
-            result = f"I don't have a tool named '{tool_name}'. Available tools are: {available_tools}"
-
-        # Generate a response incorporating the tool result.
+            result = f"I don't have a tool named '{tool_name}'. Available tools are: {available_tools}"        # Generate a response incorporating the tool result.
         system_prompt = f"""You are {self.agent_name}, a helpful AI assistant. You've used a tool to help with the user's request.
-    Format your response naturally, without explicitly mentioning that you used an internal tool unless that's important for the user to know.
-    Summarize the tool result concisely and directly answer the user's request based on it."""
+
+    RESPONSE GUIDELINES:
+    1. Format your response naturally and conversationally.
+    2. For time queries: Extract and clearly state the current time from the search results.
+    3. For weather queries: Focus on current temperature and conditions.
+    4. For news or current events: Summarize the most recent information.
+    5. Don't mention that you performed a web search unless necessary.
+    6. Keep responses concise and directly focused on the user's question.
+    7. If the search results are not relevant or don't contain the specific information asked for, say so clearly."""
 
         prompt = f"""User request: "{query}"
 
@@ -409,3 +478,66 @@ Respond helpfully, explaining what commands or questions you can handle.""" # De
         for tool_name, tool in self.tools.items():
             descriptions.append(f"{tool_name}: {tool.description}")
         return "\n".join(descriptions)
+    
+    def _format_time_response(self, search_result, location):
+        """
+        Formats the response for time-related queries.
+        """
+        if not search_result or "Error" in search_result:
+            return f"I'm sorry, I couldn't find the current time in {location}. Please try again or rephrase your question."
+
+        # Parse the response to find time information
+        result_lower = search_result.lower()
+        time_patterns = [
+            r'(\d{1,2}:\d{2}(?:\s*[ap]m)?)',  # matches patterns like "3:45 PM" or "15:45"
+            r'(\d{1,2}(?::\d{2})?\s*[ap]m)',   # matches patterns like "3 PM" or "3:45 PM"
+            r'(\d{2}:\d{2}\s*(?:hours?)?)'     # matches 24-hour format like "15:45" or "15:45 hours"
+        ]
+
+        found_time = None
+        for pattern in time_patterns:
+            matches = re.findall(pattern, result_lower)
+            if matches:
+                found_time = matches[0]
+                break
+
+        if found_time:
+            return f"The current time in {location} is {found_time}."
+        else:
+            logger.warning(f"Could not extract time from result: {search_result}")
+            return f"I found information about {location}, but I couldn't determine the exact current time. Here's what I found:\n{search_result}"
+
+    def _execute_tool(self, tool_name: str, parameters: str) -> str:
+        """Helper method to execute a tool with given parameters."""
+        try:
+            if tool_name not in self.tools:
+                available_tools = ", ".join(self.tools.keys())
+                return f"I don't have a tool named '{tool_name}'. Available tools are: {available_tools}"
+
+            tool = self.tools[tool_name]
+            result = tool.run(parameters)
+            self.state.record_tool_use(tool_name)
+            self.state.last_tool_result = result
+
+            # Generate response incorporating the tool result
+            system_prompt = f"""You are {self.agent_name}, a helpful AI assistant. Create a clear and natural response based on the tool results.
+
+RESPONSE GUIDELINES:
+1. Be concise and direct
+2. For news: Summarize the main points
+3. For time: State the time clearly
+4. For weather: Focus on current conditions
+5. No need to mention that you used a tool
+6. Don't ask follow-up questions
+7. Keep it focused on the user's request"""
+
+            prompt = f"""Tool result: {result}
+
+Create a helpful response that naturally incorporates this information."""
+
+            response = self.llm_handler.generate_response(system_prompt, prompt)
+            return response
+
+        except Exception as e:
+            logger.error(f"Error executing tool {tool_name}: {str(e)}")
+            return f"I encountered an error while trying to help you: {str(e)}"

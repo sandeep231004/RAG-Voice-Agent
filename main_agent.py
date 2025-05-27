@@ -1,6 +1,9 @@
 import logging
 import time
 import os
+import re
+from datetime import datetime
+import pytz
 from config import AGENT_CONFIG
 from qdrant_client import QdrantClient
 from initializers import ComponentInitializer
@@ -11,36 +14,141 @@ from audio_handler import AudioHandler
 from llm_handler import LLMHandler
 from task_handler import TaskHandler
 
-# --- Global Tool Placeholder (for WebSearchTool) ---
-# In a real application, you would initialize a specific web search client here,
-# e.g., from a library that interfaces with Google Search API, DuckDuckGo API, etc.
-# For this demo, we'll assume 'google_search' is available in the environment
-# as a mock or actual search utility.
-# If running locally without a real search client, you'd need to mock this or
-# integrate a specific API.
-class MockGoogleSearch:
+
+from duckduckgo_search import DDGS
+
+class DuckDuckGoSearch:
+    def __init__(self):
+        self.ddgs = DDGS()    
     def search(self, queries: list):
-        logger.info(f"Mocking web search for query: {queries[0]}")
-        class MockResult:
+        logger.info(f"Performing web search for query: {queries[0]}")
+        class SearchResult:
             def __init__(self, title, snippet, url):
                 self.source_title = title
                 self.snippet = snippet
                 self.url = url
 
-        class MockSearchResults:
+        class SearchResults:
             def __init__(self, query, results):
                 self.query = query
                 self.results = results
 
-        return [MockSearchResults(
-            query=queries[0],
-            results=[
-                MockResult("Mock Search Result 1", "This is a snippet from a mock web search result.", "https://example.com/mock1"),
-                MockResult("Mock Search Result 2", "Another mock snippet providing some information.", "https://example.com/mock2")
-            ]
-        )]
+        results = []
+        try:
+            query = queries[0]            # Handle time queries directly using pytz
+            if any(word in query.lower() for word in ["time", "current time", "what time"]):
+                try:
+                    # Extract location from query and clean it
+                    location = query.lower()
+                    if "in" in location:
+                        location = location.split("in")[-1]
+                    location = location.strip().strip('?').strip('.').strip()
+                    # Remove common words that might be attached to the location
+                    location = location.replace("right now", "").replace("now", "").strip()
+                    
+                    # Map common city names to timezone names
+                    timezone_mapping = {
+                        'london': 'Europe/London',
+                        'new york': 'America/New_York',
+                        'paris': 'Europe/Paris',
+                        'tokyo': 'Asia/Tokyo',
+                        # Add more mappings as needed
+                    }
+                    
+                    # Get the timezone
+                    tz_name = timezone_mapping.get(location.lower())
+                    if tz_name:
+                        # Get current time in the specified timezone
+                        tz = pytz.timezone(tz_name)
+                        current_time = datetime.now(tz)
+                        formatted_time = current_time.strftime("%I:%M %p")  # 12-hour format with AM/PM
+                        formatted_date = current_time.strftime("%A, %B %d, %Y")
+                        
+                        results.append(SearchResult(
+                            title=f"Current Time in {location.title()}",
+                            snippet=f"The current time in {location.title()} is {formatted_time} on {formatted_date}",
+                            url=""
+                        ))
+                        return [SearchResults(query=queries[0], results=results)]
+                    
+                except Exception as e:
+                    logger.error(f"Error getting time for location {location}: {str(e)}")
+                    # Don't continue with web search, return error message
+                    results.append(SearchResult(
+                        title="Error",
+                        snippet=f"Sorry, I encountered an error while getting the time for {location}. Please try again.",
+                        url=""
+                    ))
+                    return [SearchResults(query=queries[0], results=results)]
+              # Get results from DuckDuckGo
+            ddg_results = []
+            try:
+                # For time queries, try time.is website first
+                if any(word in query.lower() for word in ["time", "current time", "what time"]):
+                    location = query.lower().split("in")[-1].strip()
+                    ddg_results = list(self.ddgs.text(f"site:time.is current time in {location}", max_results=2))
+                
+                # If no results, try general search
+                if not ddg_results:
+                    ddg_results = list(self.ddgs.text(query, max_results=5))
+                
+                # For time queries, filter for relevant results
+                if any(word in query.lower() for word in ["time", "current time", "what time"]):
+                    filtered_results = [r for r in ddg_results if any(word in r.get('body', '').lower() for word in ["current time", "local time", "time now", "current local time"])]
+                    if filtered_results:
+                        ddg_results = filtered_results[:2]
+            except Exception as e:
+                logger.error(f"Error during DuckDuckGo search query: {str(e)}")
+                ddg_results = []
+            
+            for r in ddg_results:                # Process and clean up the result
+                try:
+                    title = r.get('title', 'No Title')
+                    body = r.get('body', '')
+                    link = r.get('link', '')
+                    
+                    # For time queries, try to extract and format time information
+                    if "time" in query.lower():
+                        time_patterns = [
+                            r'(\d{1,2}:\d{2}(?:\s*[ap]m)?)',  # 3:45 PM or 15:45
+                            r'(\d{1,2}(?::\d{2})?\s*[ap]m)',   # 3 PM or 3:45 PM
+                            r'(\d{2}:\d{2}\s*(?:hours?)?)',    # 15:45 or 15:45 hours
+                            r'(\d{1,2}(?::\d{2})?\s*(?:hrs?)?)'  # 15:45 hr
+                        ]
+                        
+                        for pattern in time_patterns:
+                            time_match = re.search(pattern, body, re.IGNORECASE)
+                            if time_match:
+                                body = f"Current time is {time_match.group(1)}"
+                                break
+                        
+                        # If no time found in body, try title
+                        if "Current time is" not in body:
+                            for pattern in time_patterns:
+                                time_match = re.search(pattern, title, re.IGNORECASE)
+                                if time_match:
+                                    body = f"Current time is {time_match.group(1)}"
+                                    break
+                    
+                    results.append(SearchResult(
+                        title=title,
+                        snippet=body,
+                        url=link
+                    ))
+                except Exception as e:
+                    logger.error(f"Error processing search result: {str(e)}")
+        except Exception as e:
+            logger.error(f"Error during DuckDuckGo search: {str(e)}")
+            # Return at least one result even on error
+            results.append(SearchResult(
+                title="Error",
+                snippet=f"Failed to perform web search: {str(e)}",
+                url=""
+            ))
 
-google_search = MockGoogleSearch()
+        return [SearchResults(query=queries[0], results=results)]
+
+search_client = DuckDuckGoSearch()
 
 logger = logging.getLogger(__name__)
 
@@ -99,7 +207,7 @@ class VoiceRAGAgent:
                 self.config["collection_name"],
                 self.config["top_k"]
             ),
-            "web_search": WebSearchTool(google_search),
+            "web_search": WebSearchTool(search_client),
         }
         logger.info(f"Initialized {len(tools_dict)} tools")
         return tools_dict
